@@ -27,7 +27,7 @@ providers:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: ${ACME_EMAIL}
+      email: alexbeuscher@gmail.com
       storage: /acme/acme.json
       httpChallenge:
         entryPoint: web

@@ -15,7 +15,6 @@ services:
       - ./acme:/acme
     environment:
       - TRAEFIK_LOG_LEVEL=INFO
-      - ACME_EMAIL=${ACME_EMAIL}
     labels:
       - "traefik.enable=true"
       # Dashboard configuration (secure this in production)
