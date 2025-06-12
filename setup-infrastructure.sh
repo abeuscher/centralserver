@@ -33,9 +33,9 @@ check_requirements() {
         exit 1
     fi
     
-    # Check if Docker is installed
+    # Install Docker
     if ! command -v docker &> /dev/null; then
-        log_warn "Docker not found. Installing Docker..."
+        log_info "Installing Docker..."
         curl -fsSL https://get.docker.com -o get-docker.sh
         sh get-docker.sh
         systemctl enable docker
@@ -43,64 +43,59 @@ check_requirements() {
         rm get-docker.sh
     fi
     
-    # Check if Docker Compose is installed
+    # Install Docker Compose
     if ! command -v docker-compose &> /dev/null; then
-        log_warn "Docker Compose not found. Installing Docker Compose..."
+        log_info "Installing Docker Compose..."
         curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
         chmod +x /usr/local/bin/docker-compose
     fi
     
-    log_info "Requirements check completed"
+    # Install required tools
+    apt-get update
+    apt-get install -y git apache2-utils openssl
+    
+    log_info "Requirements installed"
 }
 
 setup_directories() {
     log_info "Setting up directory structure..."
     
     # Load environment variables
-    if [[ -f .env ]]; then
-        source .env
-    else
+    if [[ ! -f .env ]]; then
         log_error ".env file not found. Please copy .env.template to .env and configure it."
         exit 1
     fi
     
-    # Create main directories
+    source .env
+    
+    # Create directories
     mkdir -p "$INFRASTRUCTURE_PATH"
     mkdir -p "$CLIENTS_PATH"
     mkdir -p "$BACKUPS_PATH"
-    mkdir -p ./traefik
+    mkdir -p ./traefik/dynamic
     mkdir -p ./acme
+    mkdir -p /var/log/deployments
     
-    # Set permissions for ACME storage
+    # Set permissions
     chmod 600 ./acme
+    chmod 755 "$CLIENTS_PATH"
+    chmod 755 /var/log/deployments
     
-    log_info "Directory structure created"
+    log_info "Directories created"
 }
 
 configure_firewall() {
     log_info "Configuring firewall..."
     
-    # Install ufw if not present
-    if ! command -v ufw &> /dev/null; then
-        apt-get update
-        apt-get install -y ufw
-    fi
-    
-    # Reset firewall rules
+    # Install and configure UFW
+    apt-get install -y ufw
     ufw --force reset
-    
-    # Set default policies
     ufw default deny incoming
     ufw default allow outgoing
-    
-    # Allow SSH (be careful here!)
     ufw allow ssh
-    
-    # Allow HTTP and HTTPS
     ufw allow 80/tcp
     ufw allow 443/tcp
-    
-    # Enable firewall
+    ufw allow "${WEBHOOK_PORT:-9000}/tcp"
     ufw --force enable
     
     log_info "Firewall configured"
@@ -109,58 +104,111 @@ configure_firewall() {
 setup_docker_network() {
     log_info "Setting up Docker network..."
     
-    # Create traefik network if it doesn't exist
     if ! docker network ls | grep -q traefik; then
         docker network create traefik
-        log_info "Traefik network created"
-    else
-        log_info "Traefik network already exists"
     fi
+    
+    log_info "Docker network ready"
 }
 
 deploy_traefik() {
     log_info "Deploying Traefik..."
     
-    # Check if .env file exists
-    if [[ ! -f .env ]]; then
-        log_error ".env file not found"
-        exit 1
-    fi
-    
-    # Stop existing Traefik if running
-    if docker ps | grep -q traefik; then
-        log_info "Stopping existing Traefik container..."
-        docker-compose -f docker-compose.traefik.yml down
-    fi
+    # Stop existing Traefik
+    docker-compose -f docker-compose.traefik.yml down 2>/dev/null || true
     
     # Deploy Traefik
     docker-compose -f docker-compose.traefik.yml up -d
     
-    # Wait for Traefik to be ready
-    log_info "Waiting for Traefik to be ready..."
+    # Wait and verify
     sleep 10
-    
-    # Check if Traefik is running
-    if docker ps | grep -q traefik; then
-        log_info "Traefik deployed successfully"
-    else
+    if ! docker ps | grep -q traefik; then
         log_error "Traefik deployment failed"
         exit 1
     fi
+    
+    log_info "Traefik deployed successfully"
+}
+
+install_management_scripts() {
+    log_info "Installing management scripts..."
+    
+    # Make scripts executable
+    chmod +x ./manage-client.sh
+    chmod +x ./webhook-receiver.sh
+    chmod +x ./setup-traefik-middleware.sh
+    
+    # Create symlinks
+    ln -sf "$(pwd)/manage-client.sh" /usr/local/bin/manage-client
+    ln -sf "$(pwd)/webhook-receiver.sh" /usr/local/bin/webhook-receiver
+    ln -sf "$(pwd)/setup-traefik-middleware.sh" /usr/local/bin/traefik-middleware
+    
+    log_info "Management scripts installed"
+}
+
+setup_webhook_service() {
+    log_info "Setting up webhook service..."
+    
+    cat > /etc/systemd/system/webhook-receiver.service << EOF
+[Unit]
+Description=WordPress Client Webhook Receiver
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$(pwd)
+ExecStart=$(pwd)/webhook-receiver.sh start
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable webhook-receiver
+    systemctl start webhook-receiver
+    
+    log_info "Webhook service installed and started"
+}
+
+setup_middleware_system() {
+    log_info "Setting up middleware system..."
+    
+    # Initialize middleware
+    ./setup-traefik-middleware.sh init
+    
+    # Restart Traefik to load middleware
+    docker-compose -f docker-compose.traefik.yml restart
+    
+    log_info "Middleware system ready"
 }
 
 show_completion_message() {
-    log_info "Infrastructure setup completed!"
+    log_info "✅ WordPress Infrastructure Setup Complete!"
     echo ""
-    echo "Next steps:"
-    echo "1. Access Traefik dashboard at: https://traefik.${DOMAIN}"
-    echo "2. Verify SSL certificates are being generated"
-    echo "3. Proceed to Phase 2: Starter Repository Development"
+    echo "🚀 Quick Start:"
+    echo "1. Update manage-client.sh with your starter repository URL"
+    echo "2. Create your first environment:"
+    echo "   manage-client create-environment mycompany production"
+    echo "3. Deploy it:"
+    echo "   cd /opt/clients/mycompany/production"
+    echo "   docker-compose up -d && ./setup.sh"
     echo ""
-    echo "Useful commands:"
-    echo "- View Traefik logs: docker logs traefik"
-    echo "- Restart Traefik: docker-compose -f docker-compose.traefik.yml restart"
-    echo "- Check running containers: docker ps"
+    echo "📊 System Access:"
+    echo "- Traefik Dashboard: https://traefik.${DOMAIN}"
+    echo "- Webhook Endpoint: https://$(hostname -f):${WEBHOOK_PORT:-9000}/webhook/CLIENT/ENV"
+    echo ""
+    echo "🔧 Management Commands:"
+    echo "- manage-client status"
+    echo "- webhook-receiver status"
+    echo "- traefik-middleware list"
+    echo ""
+    echo "📋 System is ready for client environments!"
 }
 
 # Main execution
@@ -172,8 +220,11 @@ main() {
     configure_firewall
     setup_docker_network
     deploy_traefik
+    install_management_scripts
+    setup_webhook_service
+    setup_middleware_system
     show_completion_message
 }
 
-# Run main function
+# Run it
 main "$@"
